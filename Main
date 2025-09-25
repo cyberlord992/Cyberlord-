@@ -1,0 +1,246 @@
+import logging
+import json
+import os
+from datetime import datetime
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler,
+)
+
+# ===== CONFIGURATION =====
+BOT_TOKEN = "8456308726:AAFVlboXvi2RLwIogYWYI7_gHSy3kwe8xtc"  # REPLACE WITH YOUR BOT TOKEN FROM @BOTFATHER
+
+# Define conversation states
+PHONE_NUMBER, APPEAL_METHOD, STATUS_UPDATE = range(3)
+
+# Appeal methods and instructions
+APPEAL_METHODS = {
+    "in_app": {
+        "name": "In-App Appeal",
+        "instructions": """
+**IN-APP APPEAL PROCESS:**
+1. Open WhatsApp on your phone.
+2. Enter your banned phone number to verify.
+3. When the ban message appears, tap **'Support'** or **'Appeal'**.
+4. Write a concise, polite appeal. Example template:
+---
+"Dear WhatsApp Support Team,
+
+My phone number, [YOUR_NUMBER], has been banned. I believe this may have been a mistake by an automated system, as I always adhere to the Terms of Service.
+
+I use WhatsApp for [STATE YOUR PURPOSE: e.g., 'communication with my family and work colleagues'] and its reinstatement would be greatly appreciated.
+
+Thank you for your time and consideration."
+
+---
+5. Submit the appeal and wait for an email response. This can take from 24 hours to several days.
+        """
+    },
+    "email": {
+        "name": "Email Appeal",
+        "instructions": """
+**EMAIL APPEAL PROCESS:**
+1. Send an email to `support@support.whatsapp.com` OR `android_web@support.whatsapp.com` (for Android) / `iphone_web@support.whatsapp.com` (for iPhone).
+2. Use a clear subject line: "Appeal for Banned Account: [YOUR_NUMBER]"
+3. In the body, include:
+   - Your banned phone number in international format.
+   - The message: "My WhatsApp account has been banned. I believe this was an error and I request a review."
+   - Be polite and to the point. Do not spam or use aggressive language.
+4. Wait for a response. Keep track of any ticket numbers they provide.
+        """
+    }
+}
+
+# ===== LOGGING =====
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ===== DATABASE FUNCTIONS =====
+def load_database():
+    """Load user data from the JSON file."""
+    if os.path.exists("database.json"):
+        with open("database.json", "r") as f:
+            return json.load(f)
+    return {"users": {}}
+
+def save_database(data):
+    """Save user data to the JSON file."""
+    with open("database.json", "w") as f:
+        json.dump(data, f, indent=4)
+
+def add_user_attempt(user_id, phone_number, method):
+    """Add a new unban attempt for a user."""
+    db = load_database()
+    if str(user_id) not in db["users"]:
+        db["users"][str(user_id)] = {"phone_number": phone_number, "attempts": []}
+
+    attempt = {
+        "timestamp": datetime.now().isoformat(),
+        "method": method,
+        "status": "submitted"  # Can be: submitted, rejected, successful
+    }
+    db["users"][str(user_id)]["attempts"].append(attempt)
+    save_database(db)
+
+def update_attempt_status(user_id, status):
+    """Update the status of the user's most recent attempt."""
+    db = load_database()
+    user_data = db["users"].get(str(user_id))
+    if user_data and user_data["attempts"]:
+        user_data["attempts"][-1]["status"] = status  # Update the latest attempt
+        save_database(db)
+        return True
+    return False
+
+def get_user_stats(user_id):
+    """Get statistics for a specific user."""
+    db = load_database()
+    user_data = db["users"].get(str(user_id))
+    if not user_data:
+        return "No attempts recorded yet."
+
+    attempts = user_data["attempts"]
+    total = len(attempts)
+    successful = len([a for a in attempts if a.get("status") == "successful"])
+    rejected = len([a for a in attempts if a.get("status") == "rejected"])
+    pending = total - successful - rejected
+
+    stats_text = f"""
+📊 **Your Appeal Statistics for {user_data['phone_number']}**
+
+• Total Appeals: {total}
+• ✅ Successful: {successful}
+• ❌ Rejected: {rejected}
+• ⏳ Pending: {pending}
+    """
+    return stats_text
+
+# ===== BOT HANDLERS =====
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a welcome message and start the process."""
+    welcome_text = """
+🚀 **WhatsApp Unban Appeal Assistant**
+
+This bot helps you navigate the process of appealing a permanent WhatsApp ban. I provide structured instructions, track your appeal attempts, and aggregate success rates.
+
+**Disclaimer:** I cannot guarantee your number will be unbanned. I automate the *process* of appealing. Success depends on WhatsApp's review and the nature of the original ban.
+
+Use /register to start a new appeal attempt.
+Use /stats to view your previous attempts.
+Use /cancel to stop any ongoing operation.
+    """
+    await update.message.reply_text(welcome_text, parse_mode='Markdown')
+
+async def register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start the registration process by asking for the phone number."""
+    await update.message.reply_text(
+        "📱 Please enter the banned phone number in *international format* (e.g., +441234567890):",
+        parse_mode='Markdown'
+    )
+    return PHONE_NUMBER
+
+async def phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Store the phone number and ask for the appeal method."""
+    phone = update.message.text
+    context.user_data['phone_number'] = phone
+
+    # Create a keyboard for appeal method selection
+    reply_keyboard = [["In-App Appeal", "Email Appeal"]]
+    await update.message.reply_text(
+        f"Number registered: {phone}. Now, choose your appeal method:",
+        reply_markup=ReplyKeyboardMarkup(
+            reply_keyboard, one_time_keyboard=True, input_field_placeholder="How will you appeal?"
+        ),
+    )
+    return APPEAL_METHOD
+
+async def appeal_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Provide instructions for the selected appeal method."""
+    method_choice = update.message.text.lower()
+    method_key = "in_app" if "in-app" in method_choice else "email"
+
+    method_info = APPEAL_METHODS[method_key]
+    instructions = method_info["instructions"]
+
+    # Record the attempt in the database
+    user_id = update.effective_user.id
+    phone_number = context.user_data['phone_number']
+    add_user_attempt(user_id, phone_number, method_info["name"])
+
+    # Send the detailed instructions
+    await update.message.reply_text(
+        f"**{method_info['name']} Instructions**\n{instructions}",
+        parse_mode='Markdown',
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+    # Ask user to report back later
+    await update.message.reply_text(
+        "Follow the instructions above. Once you get a result, use the /status command to update me: /status_success or /status_rejected."
+    )
+    return ConversationHandler.END
+
+async def status_success(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mark the latest appeal as successful."""
+    user_id = update.effective_user.id
+    if update_attempt_status(user_id, "successful"):
+        await update.message.reply_text("🎉 Fantastic news! Your appeal was successful! Your statistics have been updated.")
+    else:
+        await update.message.reply_text("No recent appeal attempt found. Please start with /register.")
+
+async def status_rejected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mark the latest appeal as rejected."""
+    user_id = update.effective_user.id
+    if update_attempt_status(user_id, "rejected"):
+        await update.message.reply_text("❌ Sorry to hear your appeal was rejected. You can try a different method with /register. Your statistics have been updated.")
+    else:
+        await update.message.reply_text("No recent appeal attempt found. Please start with /register.")
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the user's appeal statistics."""
+    user_id = update.effective_user.id
+    stats_text = get_user_stats(user_id)
+    await update.message.reply_text(stats_text, parse_mode='Markdown')
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel the current conversation."""
+    await update.message.reply_text(
+        "Operation cancelled.", reply_markup=ReplyKeyboardRemove()
+    )
+    return ConversationHandler.END
+
+# ===== MAIN FUNCTION =====
+def main() -> None:
+    """Start the bot."""
+    # Create the Application and pass it your bot's token.
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Add conversation handler for the registration process
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("register", register)],
+        states={
+            PHONE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_number)],
+            APPEAL_METHOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, appeal_method)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    application.add_handler(conv_handler)
+
+    # Add command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(CommandHandler("status_success", status_success))
+    application.add_handler(CommandHandler("status_rejected", status_rejected))
+
+    # Start the Bot
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
